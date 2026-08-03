@@ -63,6 +63,33 @@ app.get("/api/spaces/:id", (req, res) => {
   res.json(space);
 });
 
+// GET /api/spaces/:id/availability — dostupnost prostora za zadani dan
+app.get("/api/spaces/:id/availability", (req, res) => {
+  const id = Number(req.params.id);
+  const space = spaces.find((s) => s.id === id);
+  if (!space) {
+    return res.status(404).json({ error: "Prostor nije pronađen." });
+  }
+
+  const { date } = req.query; // ?date=2026-03-15
+  if (!date) {
+    return res.status(400).json({ error: "Nedostaje query parametar 'date' (YYYY-MM-DD)." });
+  }
+
+  // aktivne rezervacije za taj prostor na taj dan
+  const reservedSlots = reservations
+    .filter((r) => r.spaceId === id && r.status === "ACTIVE" && r.startTime.startsWith(date))
+    .map((r) => ({ startTime: r.startTime, endTime: r.endTime }));
+
+  res.json({
+    spaceId: id,
+    date,
+    openFrom: space.openFrom,
+    openTo: space.openTo,
+    reservedSlots,
+  });
+});
+
 // POST /api/spaces — kreiranje novog prostora
 app.post("/api/spaces", (req, res) => {
   const { name, description, location, type, capacity, openFrom, openTo } = req.body;
