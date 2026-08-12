@@ -1,0 +1,49 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+model Space {
+  id           Int           @id @default(autoincrement())
+  name         String
+  description  String        @db.Text
+  location     String
+  type         SpaceType
+  capacity     Int           @default(1)
+  openFrom     String
+  openTo       String
+  providerId   Int
+  reservations Reservation[]
+  createdAt    DateTime      @default(now())
+}
+
+model Reservation {
+  id        Int               @id @default(autoincrement())
+  space     Space             @relation(fields: [spaceId], references: [id])
+  spaceId   Int
+  userId    Int
+  startTime DateTime
+  endTime   DateTime
+  status    ReservationStatus @default(ACTIVE)
+  createdAt DateTime          @default(now())
+}
+
+enum SpaceType {
+  READING_ROOM
+  GROUP_ROOM
+  QUIET_ROOM
+}
+
+enum ReservationStatus {
+  ACTIVE
+  CANCELLED
+}
