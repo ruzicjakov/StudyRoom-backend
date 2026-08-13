@@ -1,6 +1,12 @@
 // src/index.js
-const express = require("express");
-const cors = require("cors");
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import { PrismaClient } from "./generated/prisma/index.js";
+import { PrismaMariaDb } from "@prisma/adapter-mariadb";
+
+const adapter = new PrismaMariaDb(process.env.DATABASE_URL);
+const prisma = new PrismaClient({ adapter });
 
 const app = express();
 
@@ -8,54 +14,27 @@ const app = express();
 app.use(cors());            // dopušta pozive s frontenda (druga adresa)
 app.use(express.json());    // parsira JSON tijelo dolaznih zahtjeva
 
-// --- mock podaci (privremeno, umjesto baze) ---
-const spaces = [
-  {
-    id: 1,
-    name: "Grupna soba A",
-    description: "Soba za grupno učenje s pločom",
-    location: "Pula, Zagrebačka 30",
-    type: "GROUP_ROOM",
-    capacity: 6,
-    openFrom: "08:00",
-    openTo: "22:00",
-    providerId: 2,
-  },
-  {
-    id: 2,
-    name: "Tiha soba 1",
-    description: "Individualno mjesto za učenje",
-    location: "Pula, Zagrebačka 30",
-    type: "QUIET_ROOM",
-    capacity: 1,
-    openFrom: "08:00",
-    openTo: "20:00",
-    providerId: 2,
-  },
-];
-
-// --- mock rezervacije ---
-const reservations = [
-  {
-    id: 1,
-    userId: 1,
-    spaceId: 1,
-    startTime: "2026-03-15T10:00:00",
-    endTime: "2026-03-15T12:00:00",
-    status: "ACTIVE",
-  },
-];
-
 // --- rute: prostori ---
-// GET /api/spaces — popis svih prostora
-app.get("/api/spaces", (req, res) => {
+
+// GET /api/spaces — popis svih prostora (s filtrima)
+app.get("/api/spaces", async (req, res) => {
+  const { location, type, minCapacity, search } = req.query;
+
+  const where = {};
+  if (location) where.location = { contains: location };
+  if (type) where.type = type;
+  if (minCapacity) where.capacity = { gte: Number(minCapacity) };
+  if (search) where.name = { contains: search };
+
+  const spaces = await prisma.space.findMany({ where });
   res.json(spaces);
 });
 
-// GET /api/spaces/:id — dohvat jednog prostora po ID-u
-app.get("/api/spaces/:id", (req, res) => {
-  const id = Number(req.params.id);
-  const space = spaces.find((s) => s.id === id);
+// GET /api/spaces/:id — dohvat jednog prostora
+app.get("/api/spaces/:id", async (req, res) => {
+  const space = await prisma.space.findUnique({
+    where: { id: Number(req.params.id) },
+  });
 
   if (!space) {
     return res.status(404).json({ error: "Prostor nije pronađen." });
@@ -63,10 +42,10 @@ app.get("/api/spaces/:id", (req, res) => {
   res.json(space);
 });
 
-// GET /api/spaces/:id/availability — dostupnost prostora za zadani dan
-app.get("/api/spaces/:id/availability", (req, res) => {
+// GET /api/spaces/:id/availability — dostupnost za dan
+app.get("/api/spaces/:id/availability", async (req, res) => {
   const id = Number(req.params.id);
-  const space = spaces.find((s) => s.id === id);
+  const space = await prisma.space.findUnique({ where: { id } });
   if (!space) {
     return res.status(404).json({ error: "Prostor nije pronađen." });
   }
@@ -77,99 +56,85 @@ app.get("/api/spaces/:id/availability", (req, res) => {
   }
 
   // aktivne rezervacije za taj prostor na taj dan
-  const reservedSlots = reservations
-    .filter((r) => r.spaceId === id && r.status === "ACTIVE" && r.startTime.startsWith(date))
-    .map((r) => ({ startTime: r.startTime, endTime: r.endTime }));
+  const start = new Date(`${date}T00:00:00`);
+  const end = new Date(`${date}T23:59:59`);
+
+  const reserved = await prisma.reservation.findMany({
+    where: {
+      spaceId: id,
+      status: "ACTIVE",
+      startTime: { gte: start, lte: end },
+    },
+    select: { startTime: true, endTime: true },
+  });
 
   res.json({
     spaceId: id,
     date,
     openFrom: space.openFrom,
     openTo: space.openTo,
-    reservedSlots,
+    reservedSlots: reserved,
   });
 });
 
-// POST /api/spaces — kreiranje novog prostora
-app.post("/api/spaces", (req, res) => {
+// POST /api/spaces — kreiranje prostora
+app.post("/api/spaces", async (req, res) => {
   const { name, description, location, type, capacity, openFrom, openTo } = req.body;
 
-  // osnovna validacija
   if (!name || !location || !type) {
     return res.status(400).json({ error: "Nedostaju obavezna polja (name, location, type)." });
   }
 
-  const newSpace = {
-    id: spaces.length ? spaces[spaces.length - 1].id + 1 : 1, // sljedeći ID
-    name,
-    description: description || "",
-    location,
-    type,
-    capacity: capacity || 1,
-    openFrom: openFrom || "08:00",
-    openTo: openTo || "22:00",
-    providerId: 2, // privremeno fiksno (kasnije iz prijavljenog korisnika)
-  };
+  const newSpace = await prisma.space.create({
+    data: {
+      name,
+      description: description || "",
+      location,
+      type,
+      capacity: capacity || 1,
+      openFrom: openFrom || "08:00",
+      openTo: openTo || "22:00",
+      providerId: 2, // privremeno fiksno
+    },
+  });
 
-  spaces.push(newSpace);
   res.status(201).json(newSpace);
 });
 
-// PUT /api/spaces/:id — izmjena postojećeg prostora
-app.put("/api/spaces/:id", (req, res) => {
+// PUT /api/spaces/:id — izmjena prostora
+app.put("/api/spaces/:id", async (req, res) => {
   const id = Number(req.params.id);
-  const space = spaces.find((s) => s.id === id);
-
-  if (!space) {
+  const postoji = await prisma.space.findUnique({ where: { id } });
+  if (!postoji) {
     return res.status(404).json({ error: "Prostor nije pronađen." });
   }
 
-  // ažuriramo samo poslana polja
   const { name, description, location, type, capacity, openFrom, openTo } = req.body;
-  if (name !== undefined) space.name = name;
-  if (description !== undefined) space.description = description;
-  if (location !== undefined) space.location = location;
-  if (type !== undefined) space.type = type;
-  if (capacity !== undefined) space.capacity = capacity;
-  if (openFrom !== undefined) space.openFrom = openFrom;
-  if (openTo !== undefined) space.openTo = openTo;
 
-  res.json(space);
+  const updated = await prisma.space.update({
+    where: { id },
+    data: { name, description, location, type, capacity, openFrom, openTo },
+  });
+
+  res.json(updated);
 });
 
 // DELETE /api/spaces/:id — brisanje prostora
-app.delete("/api/spaces/:id", (req, res) => {
+app.delete("/api/spaces/:id", async (req, res) => {
   const id = Number(req.params.id);
-  const index = spaces.findIndex((s) => s.id === id);
-
-  if (index === -1) {
+  const postoji = await prisma.space.findUnique({ where: { id } });
+  if (!postoji) {
     return res.status(404).json({ error: "Prostor nije pronađen." });
   }
 
-  spaces.splice(index, 1); // makni iz niza
+  await prisma.space.delete({ where: { id } });
   res.json({ message: "Prostor uspješno obrisan." });
 });
 
-// --- pomoćna funkcija: provjera preklapanja termina ---
-function sePreklapa(spaceId, startTime, endTime) {
-  const noviStart = new Date(startTime);
-  const noviEnd = new Date(endTime);
-
-  return reservations.some((r) => {
-    if (r.spaceId !== spaceId) return false;   // drugi prostor - ne smeta
-    if (r.status !== "ACTIVE") return false;    // otkazane ne broje
-
-    const postojeciStart = new Date(r.startTime);
-    const postojeciEnd = new Date(r.endTime);
-
-    // preklapanje intervala: postojeci.start < novi.end  I  postojeci.end > novi.start
-    return postojeciStart < noviEnd && postojeciEnd > noviStart;
-  });
-}
-
 // --- rute: rezervacije ---
+
 // POST /api/reservations — kreiranje rezervacije
-app.post("/api/reservations", (req, res) => {
+app.post("/api/reservations", async (req, res) => {
   const { spaceId, startTime, endTime } = req.body;
 
   // 1. validacija - jesu li polja tu
@@ -178,68 +143,85 @@ app.post("/api/reservations", (req, res) => {
   }
 
   // 2. postoji li prostor
-  const space = spaces.find((s) => s.id === Number(spaceId));
+  const space = await prisma.space.findUnique({ where: { id: Number(spaceId) } });
   if (!space) {
     return res.status(404).json({ error: "Prostor nije pronađen." });
   }
 
   // 3. je li kraj nakon početka
-  if (new Date(endTime) <= new Date(startTime)) {
+  const noviStart = new Date(startTime);
+  const noviEnd = new Date(endTime);
+  if (noviEnd <= noviStart) {
     return res.status(400).json({ error: "Kraj termina mora biti nakon početka." });
   }
 
-  // 4. provjera preklapanja
-  if (sePreklapa(Number(spaceId), startTime, endTime)) {
+  // 4. provjera preklapanja - traži aktivnu rezervaciju koja se preklapa
+  //    uvjet: postojeci.start < novi.end  I  postojeci.end > novi.start
+  const konflikt = await prisma.reservation.findFirst({
+    where: {
+      spaceId: Number(spaceId),
+      status: "ACTIVE",
+      startTime: { lt: noviEnd },
+      endTime: { gt: noviStart },
+    },
+  });
+
+  if (konflikt) {
     return res.status(409).json({ error: "Odabrani termin se preklapa s postojećom rezervacijom." });
   }
 
   // 5. kreiraj
-  const novaRezervacija = {
-    id: reservations.length ? reservations[reservations.length - 1].id + 1 : 1,
-    userId: 1, // privremeno fiksno (kasnije iz prijavljenog korisnika)
-    spaceId: Number(spaceId),
-    startTime,
-    endTime,
-    status: "ACTIVE",
-  };
+  const novaRezervacija = await prisma.reservation.create({
+    data: {
+      spaceId: Number(spaceId),
+      userId: 1, // privremeno fiksno
+      startTime: noviStart,
+      endTime: noviEnd,
+      status: "ACTIVE",
+    },
+  });
 
-  reservations.push(novaRezervacija);
   res.status(201).json(novaRezervacija);
 });
 
 // GET /api/reservations/me — moje rezervacije
-app.get("/api/reservations/me", (req, res) => {
+app.get("/api/reservations/me", async (req, res) => {
   const userId = 1; // privremeno fiksno
 
-  const mojeRezervacije = reservations
-    .filter((r) => r.userId === userId)
-    .map((r) => {
-      const space = spaces.find((s) => s.id === r.spaceId);
-      return {
-        id: r.id,
-        spaceId: r.spaceId,
-        spaceName: space ? space.name : null,
-        location: space ? space.location : null,
-        startTime: r.startTime,
-        endTime: r.endTime,
-        status: r.status,
-      };
-    });
+  const rezervacije = await prisma.reservation.findMany({
+    where: { userId },
+    include: { space: true }, // dohvati i povezani prostor
+  });
 
-  res.json(mojeRezervacije);
+  // oblikuj odgovor (naziv/lokacija iz povezanog prostora)
+  const rezultat = rezervacije.map((r) => ({
+    id: r.id,
+    spaceId: r.spaceId,
+    spaceName: r.space ? r.space.name : null,
+    location: r.space ? r.space.location : null,
+    startTime: r.startTime,
+    endTime: r.endTime,
+    status: r.status,
+  }));
+
+  res.json(rezultat);
 });
 
 // DELETE /api/reservations/:id — otkazivanje vlastite rezervacije
-app.delete("/api/reservations/:id", (req, res) => {
+app.delete("/api/reservations/:id", async (req, res) => {
   const id = Number(req.params.id);
-  const rezervacija = reservations.find((r) => r.id === id);
+  const rezervacija = await prisma.reservation.findUnique({ where: { id } });
 
   if (!rezervacija) {
     return res.status(404).json({ error: "Rezervacija nije pronađena." });
   }
 
-  rezervacija.status = "CANCELLED"; // ne brišemo, samo mijenjamo status
-  res.json({ message: "Rezervacija otkazana.", id: rezervacija.id, status: rezervacija.status });
+  const updated = await prisma.reservation.update({
+    where: { id },
+    data: { status: "CANCELLED" }, // ne brišemo, samo mijenjamo status
+  });
+
+  res.json({ message: "Rezervacija otkazana.", id: updated.id, status: updated.status });
 });
 
 // --- pokretanje servera ---
