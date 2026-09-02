@@ -131,6 +131,22 @@ app.delete("/api/spaces/:id", async (req, res) => {
   res.json({ message: "Prostor uspješno obrisan." });
 });
 
+// GET /api/spaces/:id/reservations — rezervacije za određeni prostor (pružatelj)
+app.get("/api/spaces/:id/reservations", async (req, res) => {
+  const id = Number(req.params.id);
+  const space = await prisma.space.findUnique({ where: { id } });
+  if (!space) {
+    return res.status(404).json({ error: "Prostor nije pronađen." });
+  }
+
+  const rezervacije = await prisma.reservation.findMany({
+    where: { spaceId: id, status: "ACTIVE" },
+    orderBy: { startTime: "asc" },
+  });
+
+  res.json(rezervacije);
+});
+
 // --- rute: rezervacije ---
 
 // POST /api/reservations — kreiranje rezervacije
