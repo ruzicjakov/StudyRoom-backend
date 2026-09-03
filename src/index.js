@@ -5,7 +5,18 @@ import cors from "cors";
 import { PrismaClient } from "./generated/prisma/index.js";
 import { PrismaMariaDb } from "@prisma/adapter-mariadb";
 
-const adapter = new PrismaMariaDb(process.env.DATABASE_URL);
+const dbUrl = new URL(process.env.DATABASE_URL);
+const isLocal = dbUrl.hostname === "localhost" || dbUrl.hostname === "127.0.0.1";
+
+const adapter = new PrismaMariaDb({
+  host: dbUrl.hostname,
+  port: Number(dbUrl.port || 3306),
+  user: dbUrl.username,
+  password: decodeURIComponent(dbUrl.password),
+  database: dbUrl.pathname.slice(1),
+    ssl: isLocal ? undefined : { rejectUnauthorized: false },
+});
+
 const prisma = new PrismaClient({ adapter });
 
 const app = express();
@@ -241,7 +252,7 @@ app.delete("/api/reservations/:id", async (req, res) => {
 });
 
 // --- pokretanje servera ---
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server radi na http://localhost:${PORT}`);
+  console.log(`Server radi na portu ${PORT}`);
 });
