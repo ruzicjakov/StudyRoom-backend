@@ -8,23 +8,10 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/ruzicjakov/StudyRoom-backend.git"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/ruzicjakov/StudyRoom-backend/issues"
-  },
-  "homepage": "https://github.com/ruzicjakov/StudyRoom-backend#readme",
   "dependencies": {
-    "@prisma/adapter-mariadb": "^7.9.1",
-    "@prisma/client": "^7.9.1",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "prisma": "^7.9.1"
+    "mysql2": "^3.9.0"
   }
 }

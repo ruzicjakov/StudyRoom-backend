@@ -2,27 +2,12 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { PrismaClient } from "./generated/prisma/index.js";
-import { PrismaMariaDb } from "@prisma/adapter-mariadb";
-
-const dbUrl = new URL(process.env.DATABASE_URL);
-const isLocal = dbUrl.hostname === "localhost" || dbUrl.hostname === "127.0.0.1";
-
-const adapter = new PrismaMariaDb({
-  host: dbUrl.hostname,
-  port: Number(dbUrl.port || 3306),
-  user: dbUrl.username,
-  password: decodeURIComponent(dbUrl.password),
-  database: dbUrl.pathname.slice(1),
-    ssl: isLocal ? undefined : { rejectUnauthorized: false },
-});
-
-const prisma = new PrismaClient({ adapter });
+import pool from "./db.js"; // Importiramo našu konekciju na MySQL
 
 const app = express();
 
 // --- middleware ---
-app.use(cors());            // dopušta pozive s frontenda (druga adresa)
+app.use(cors());            // dopušta pozive s frontenda
 app.use(express.json());    // parsira JSON tijelo dolaznih zahtjeva
 
 // --- rute: prostori ---
@@ -31,61 +16,81 @@ app.use(express.json());    // parsira JSON tijelo dolaznih zahtjeva
 app.get("/api/spaces", async (req, res) => {
   const { location, type, minCapacity, search } = req.query;
 
-  const where = {};
-  if (location) where.location = { contains: location };
-  if (type) where.type = type;
-  if (minCapacity) where.capacity = { gte: Number(minCapacity) };
-  if (search) where.name = { contains: search };
+  try {
+    // Gradimo dinamički SQL upit
+    let sql = "SELECT * FROM Space WHERE 1=1";
+    const params = [];
 
-  const spaces = await prisma.space.findMany({ where });
-  res.json(spaces);
+    if (location) {
+      sql += " AND location LIKE ?";
+      params.push(`%${location}%`);
+    }
+    if (type) {
+      sql += " AND type = ?";
+      params.push(type);
+    }
+    if (minCapacity) {
+      sql += " AND capacity >= ?";
+      params.push(Number(minCapacity));
+    }
+    if (search) {
+      sql += " AND name LIKE ?";
+      params.push(`%${search}%`);
+    }
+
+    const [spaces] = await pool.execute(sql, params);
+    res.json(spaces);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Greška baze podataka" });
+  }
 });
 
 // GET /api/spaces/:id — dohvat jednog prostora
 app.get("/api/spaces/:id", async (req, res) => {
-  const space = await prisma.space.findUnique({
-    where: { id: Number(req.params.id) },
-  });
-
-  if (!space) {
-    return res.status(404).json({ error: "Prostor nije pronađen." });
+  const id = Number(req.params.id);
+  try {
+    const [rows] = await pool.execute("SELECT * FROM Space WHERE id = ?", [id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Prostor nije pronađen." });
+    }
+    res.json(rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: "Greška baze podataka" });
   }
-  res.json(space);
 });
 
 // GET /api/spaces/:id/availability — dostupnost za dan
 app.get("/api/spaces/:id/availability", async (req, res) => {
   const id = Number(req.params.id);
-  const space = await prisma.space.findUnique({ where: { id } });
-  if (!space) {
-    return res.status(404).json({ error: "Prostor nije pronađen." });
-  }
+  const { date } = req.query;
 
-  const { date } = req.query; // ?date=2026-03-15
-  if (!date) {
-    return res.status(400).json({ error: "Nedostaje query parametar 'date' (YYYY-MM-DD)." });
-  }
+  if (!date) return res.status(400).json({ error: "Nedostaje parametar date" });
 
-  // aktivne rezervacije za taj prostor na taj dan
-  const start = new Date(`${date}T00:00:00`);
-  const end = new Date(`${date}T23:59:59`);
+  try {
+    const [spaceRows] = await pool.execute("SELECT openFrom, openTo FROM Space WHERE id = ?", [id]);
+    if (spaceRows.length === 0) return res.status(404).json({ error: "Prostor nije pronađen." });
 
-  const reserved = await prisma.reservation.findMany({
-    where: {
+    const start = `${date} 00:00:00`;
+    const end = `${date} 23:59:59`;
+
+    const [reserved] = await pool.execute(`
+      SELECT startTime, endTime 
+      FROM Reservation 
+      WHERE spaceId = ? AND status = 'ACTIVE' AND startTime >= ? AND startTime <= ?
+    `, [id, start, end]);
+
+    res.json({
       spaceId: id,
-      status: "ACTIVE",
-      startTime: { gte: start, lte: end },
-    },
-    select: { startTime: true, endTime: true },
-  });
-
-  res.json({
-    spaceId: id,
-    date,
-    openFrom: space.openFrom,
-    openTo: space.openTo,
-    reservedSlots: reserved,
-  });
+      date,
+      openFrom: spaceRows[0].openFrom,
+      openTo: spaceRows[0].openTo,
+      reservedSlots: reserved,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Greška baze podataka" });
+  }
 });
 
 // POST /api/spaces — kreiranje prostora
@@ -93,69 +98,76 @@ app.post("/api/spaces", async (req, res) => {
   const { name, description, location, type, capacity, openFrom, openTo } = req.body;
 
   if (!name || !location || !type) {
-    return res.status(400).json({ error: "Nedostaju obavezna polja (name, location, type)." });
+    return res.status(400).json({ error: "Nedostaju obavezna polja." });
   }
 
-  const newSpace = await prisma.space.create({
-    data: {
-      name,
-      description: description || "",
-      location,
-      type,
-      capacity: capacity || 1,
-      openFrom: openFrom || "08:00",
-      openTo: openTo || "22:00",
-      providerId: 2, // privremeno fiksno
-    },
-  });
+  try {
+    const [result] = await pool.execute(`
+      INSERT INTO Space (name, description, location, type, capacity, openFrom, openTo, providerId) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      name, 
+      description || "", 
+      location, 
+      type, 
+      capacity || 1, 
+      openFrom || "08:00", 
+      openTo || "22:00", 
+      2 // providerId
+    ]);
 
-  res.status(201).json(newSpace);
+    res.status(201).json({ id: result.insertId, message: "Prostor kreiran" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Greška pri kreiranju" });
+  }
 });
 
 // PUT /api/spaces/:id — izmjena prostora
 app.put("/api/spaces/:id", async (req, res) => {
   const id = Number(req.params.id);
-  const postoji = await prisma.space.findUnique({ where: { id } });
-  if (!postoji) {
-    return res.status(404).json({ error: "Prostor nije pronađen." });
-  }
-
   const { name, description, location, type, capacity, openFrom, openTo } = req.body;
 
-  const updated = await prisma.space.update({
-    where: { id },
-    data: { name, description, location, type, capacity, openFrom, openTo },
-  });
+  try {
+    const [result] = await pool.execute(`
+      UPDATE Space 
+      SET name = ?, description = ?, location = ?, type = ?, capacity = ?, openFrom = ?, openTo = ?
+      WHERE id = ?
+    `, [name, description, location, type, capacity, openFrom, openTo, id]);
 
-  res.json(updated);
+    if (result.affectedRows === 0) return res.status(404).json({ error: "Prostor nije pronađen." });
+    res.json({ message: "Prostor ažuriran" });
+  } catch (error) {
+    res.status(500).json({ error: "Greška baze podataka" });
+  }
 });
 
 // DELETE /api/spaces/:id — brisanje prostora
 app.delete("/api/spaces/:id", async (req, res) => {
   const id = Number(req.params.id);
-  const postoji = await prisma.space.findUnique({ where: { id } });
-  if (!postoji) {
-    return res.status(404).json({ error: "Prostor nije pronađen." });
+  try {
+    const [result] = await pool.execute("DELETE FROM Space WHERE id = ?", [id]);
+    if (result.affectedRows === 0) return res.status(404).json({ error: "Prostor nije pronađen." });
+    res.json({ message: "Prostor uspješno obrisan." });
+  } catch (error) {
+    // Ovdje će baza baciti grešku ako postoje vezane rezervacije!
+    console.error(error);
+    res.status(500).json({ error: "Greška pri brisanju (možda postoje rezervacije)" });
   }
-
-  await prisma.space.delete({ where: { id } });
-  res.json({ message: "Prostor uspješno obrisan." });
 });
 
-// GET /api/spaces/:id/reservations — rezervacije za određeni prostor (pružatelj)
+// GET /api/spaces/:id/reservations — rezervacije za određeni prostor
 app.get("/api/spaces/:id/reservations", async (req, res) => {
   const id = Number(req.params.id);
-  const space = await prisma.space.findUnique({ where: { id } });
-  if (!space) {
-    return res.status(404).json({ error: "Prostor nije pronađen." });
+  try {
+    const [rezervacije] = await pool.execute(
+      "SELECT * FROM Reservation WHERE spaceId = ? AND status = 'ACTIVE' ORDER BY startTime ASC", 
+      [id]
+    );
+    res.json(rezervacije);
+  } catch (error) {
+    res.status(500).json({ error: "Greška baze podataka" });
   }
-
-  const rezervacije = await prisma.reservation.findMany({
-    where: { spaceId: id, status: "ACTIVE" },
-    orderBy: { startTime: "asc" },
-  });
-
-  res.json(rezervacije);
 });
 
 // --- rute: rezervacije ---
@@ -164,95 +176,70 @@ app.get("/api/spaces/:id/reservations", async (req, res) => {
 app.post("/api/reservations", async (req, res) => {
   const { spaceId, startTime, endTime } = req.body;
 
-  // 1. validacija - jesu li polja tu
   if (!spaceId || !startTime || !endTime) {
-    return res.status(400).json({ error: "Nedostaju polja (spaceId, startTime, endTime)." });
+    return res.status(400).json({ error: "Nedostaju polja." });
   }
 
-  // 2. postoji li prostor
-  const space = await prisma.space.findUnique({ where: { id: Number(spaceId) } });
-  if (!space) {
-    return res.status(404).json({ error: "Prostor nije pronađen." });
+  const start = new Date(startTime);
+  const end = new Date(endTime);
+
+  if (end <= start) {
+    return res.status(400).json({ error: "Kraj mora biti nakon početka." });
   }
 
-  // 3. je li kraj nakon početka
-  const noviStart = new Date(startTime);
-  const noviEnd = new Date(endTime);
-  if (noviEnd <= noviStart) {
-    return res.status(400).json({ error: "Kraj termina mora biti nakon početka." });
+  try {
+    const [konflikti] = await pool.execute(`
+      SELECT id FROM Reservation 
+      WHERE spaceId = ? AND status = 'ACTIVE' 
+      AND startTime < ? AND endTime > ?
+    `, [spaceId, end, start]);
+
+    if (konflikti.length > 0) {
+      return res.status(409).json({ error: "Preklapanje termina!" });
+    }
+
+    const [result] = await pool.execute(`
+      INSERT INTO Reservation (spaceId, userId, startTime, endTime, status) 
+      VALUES (?, ?, ?, ?, 'ACTIVE')
+    `, [spaceId, 1, start, end]); // userId fiksno 1
+
+    res.status(201).json({ id: result.insertId, message: "Rezervacija kreirana" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Greška baze podataka" });
   }
-
-  // 4. provjera preklapanja - traži aktivnu rezervaciju koja se preklapa
-  //    uvjet: postojeci.start < novi.end  I  postojeci.end > novi.start
-  const konflikt = await prisma.reservation.findFirst({
-    where: {
-      spaceId: Number(spaceId),
-      status: "ACTIVE",
-      startTime: { lt: noviEnd },
-      endTime: { gt: noviStart },
-    },
-  });
-
-  if (konflikt) {
-    return res.status(409).json({ error: "Odabrani termin se preklapa s postojećom rezervacijom." });
-  }
-
-  // 5. kreiraj
-  const novaRezervacija = await prisma.reservation.create({
-    data: {
-      spaceId: Number(spaceId),
-      userId: 1, // privremeno fiksno
-      startTime: noviStart,
-      endTime: noviEnd,
-      status: "ACTIVE",
-    },
-  });
-
-  res.status(201).json(novaRezervacija);
 });
 
-// GET /api/reservations/me — moje rezervacije
+// GET /api/reservations/me — moje rezervacije (sa JOIN)
 app.get("/api/reservations/me", async (req, res) => {
-  const userId = 1; // privremeno fiksno
-
-  const rezervacije = await prisma.reservation.findMany({
-    where: { userId },
-    include: { space: true }, // dohvati i povezani prostor
-  });
-
-  // oblikuj odgovor (naziv/lokacija iz povezanog prostora)
-  const rezultat = rezervacije.map((r) => ({
-    id: r.id,
-    spaceId: r.spaceId,
-    spaceName: r.space ? r.space.name : null,
-    location: r.space ? r.space.location : null,
-    startTime: r.startTime,
-    endTime: r.endTime,
-    status: r.status,
-  }));
-
-  res.json(rezultat);
+  const userId = 1;
+  try {
+    const [rezervacije] = await pool.execute(`
+      SELECT r.id, r.spaceId, s.name AS spaceName, s.location, r.startTime, r.endTime, r.status
+      FROM Reservation r
+      LEFT JOIN Space s ON r.spaceId = s.id
+      WHERE r.userId = ?
+    `, [userId]);
+    res.json(rezervacije);
+  } catch (error) {
+    res.status(500).json({ error: "Greška baze podataka" });
+  }
 });
 
-// DELETE /api/reservations/:id — otkazivanje vlastite rezervacije
+// DELETE /api/reservations/:id — otkazivanje rezervacije
 app.delete("/api/reservations/:id", async (req, res) => {
   const id = Number(req.params.id);
-  const rezervacija = await prisma.reservation.findUnique({ where: { id } });
-
-  if (!rezervacija) {
-    return res.status(404).json({ error: "Rezervacija nije pronađena." });
+  try {
+    const [result] = await pool.execute(
+      "UPDATE Reservation SET status = 'CANCELLED' WHERE id = ?", 
+      [id]
+    );
+    if (result.affectedRows === 0) return res.status(404).json({ error: "Rezervacija nije pronađena." });
+    res.json({ message: "Rezervacija otkazana." });
+  } catch (error) {
+    res.status(500).json({ error: "Greška baze podataka" });
   }
-
-  const updated = await prisma.reservation.update({
-    where: { id },
-    data: { status: "CANCELLED" }, // ne brišemo, samo mijenjamo status
-  });
-
-  res.json({ message: "Rezervacija otkazana.", id: updated.id, status: updated.status });
 });
 
-// --- pokretanje servera ---
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server radi na portu ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server radi na portu ${PORT}`));
