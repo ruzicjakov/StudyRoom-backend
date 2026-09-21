@@ -241,5 +241,4 @@ app.delete("/api/reservations/:id", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server radi na portu ${PORT}`));
+export default app;
